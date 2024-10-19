@@ -1,60 +1,116 @@
+"""
+THIS IS WHAT THE PROJECT DOES.
+
+HOW TO USE THIS:
+
+pass in the csv file as the only argument
+
+`$ python project_revit_version_broad.py <CSV_PATH>`
+"""
+
+import sys
+import os
 import requests
 import json
-import time
-import pandas as pd  # Import pandas to read the CSV file
+import datetime 
+import csv
+import dotenv
 
 # Import configuration variables from the specified file
-from ..acc_refs.config import CLIENT_ID, CLIENT_SECRET, HUB_ID, CSV_FILE_PATH
+
+dotenv.load_dotenv()
+
+CLIENT_ID = os.getenv("CLIENT_ID")
+CLIENT_SECRET=os.getenv("CLIENT_SECRET")
+HUB_ID=os.getenv("HUB_ID")
+ACCESS_TOKEN = os.getenv("AUTODESK_ACCESS_TOKEN", None)
+
+CSV_FILE_PATH= sys.argv[1]
 
 # Global variable to store the access token and its expiration time
-access_token = None
 token_expiration_time = 0
 TOKEN_EXPIRATION_BUFFER = 60  # Buffer time in seconds before token expiration
+AUTODESK_API_BASE = "https://developer.api.autodesk.com"
 
-def get_project_ids_from_csv(file_path):
-    df = pd.read_csv(file_path)
-    project_ids = ["b." + str(id) for id in df.iloc[:, 0]]  # Add "b." prefix to each ID
-    return project_ids
+def get_project_ids_from_csv(file_path:str) -> list[str]:
+    with open(file_path) as csvfile:
+        data = csv.DictReader(csvfile.read())
+    return [f"b.{row['id']}" for row in data]  # Add "b." prefix to each ID
 
-def authenticate():
-    global access_token, token_expiration_time
-    if access_token and time.time() < token_expiration_time - TOKEN_EXPIRATION_BUFFER:
-        return access_token
+def validate_token(
+        access_token: str | None,
+        token_expiration_time: datetime.datetime, 
+) -> bool:
+    """Checks to see if the current API_TOKEN is valid"""
+    return access_token and datetime.datetime.now() < token_expiration_time + datetime.timedelta(seconds=TOKEN_EXPIRATION_BUFFER)
 
-    token_url = 'https://developer.api.autodesk.com/authentication/v2/token'
+def refresh_token() -> tuple[str, datetime.datetime]:
+    """Generate a new token"""
+    token_url = f"{AUTODESK_API_BASE}/authentication/v2/token"
     data = {
-        'client_id': CLIENT_ID,
-        'client_secret': CLIENT_SECRET,
-        'grant_type': 'client_credentials',
-        'scope': 'data:read data:write'  # Adjust scope according to your needs
+        "client_id": CLIENT_ID,
+        "client_secret": CLIENT_SECRET,
+        "grant_type": "client_credentials",
+        "scope": "data:read data:write"  # Adjust scope according to your needs
     }
     response = requests.post(token_url, data=data)
-    if response.status_code != 200:
-        print(f"Error authenticating: {response.status_code}, {response.text}")
-        response.raise_for_status()
+    response.raise_for_status()
     token_data = response.json()
     access_token = token_data['access_token']
-    token_expiration_time = time.time() + token_data['expires_in']
-    return access_token
+    token_expiration_time = datetime.datetime.now() + token_data['expires_in']
+    return access_token, token_expiration_time
 
-def fetch_folder_contents(project_id, folder_id):
-    access_token = authenticate()
-    contents_url = f'https://developer.api.autodesk.com/data/v1/projects/{project_id}/folders/{folder_id}/contents'
+session = requests.Session()
+api_request = requests.Request(
+    method="GET",
     headers = {
-        "Authorization": f"Bearer {access_token}"
-    }
-    contents_response = requests.get(contents_url, headers=headers)
+        "Authorization": f"Bearer {ACCESS_TOKEN}"
+    },
+)
+base_request = session.prepare_request(api_request)
+
+
+def fetch_folder_contents(
+        session: requests.Session,
+        request:requests.PreparedRequest,
+        project_id: str,
+        folder_id: str,
+) -> dict[str, str]:
+    """Return the results from querying the api for the contents of the folder ID"""
+
+    request.url = f"{AUTODESK_API_BASE}/data/v1/projects/{project_id}/folders/{folder_id}/contents"
+    contents_response = session.send(request)
     contents_response.raise_for_status()
     return contents_response.json()
 
-def extract_revit_data(project_id, project_name, folder_id):
-    contents_data = fetch_folder_contents(project_id, folder_id)
 
-    for item in contents_data['data']:
-        if 'attributes' in item and 'displayName' in item['attributes']:
-            display_name = item['attributes']['displayName']
-            item_id = item['id']
-            
+def is_folder(item: dict[str, str]):
+    return item.get('type') == "folders"
+
+
+def search_folders_recursively(folder_contents_response_data: dict[str, str|int]):
+
+    for item in filter(is_folder, folder_contents_response_data):
+        folder_name = item['attributes']['displayName']
+
+        if 'Shared' not in folder_name: #Shared folders always contains "Shared"
+            revit_data = search_folders_recursively(project_id, project_name, item['id'])
+            if revit_data:
+                return revit_data
+        elif item['type'] == 'items' and 'attributes' in item and 'displayName' in item['attributes']:
+            revit_data = extract_revit_data(project_id, project_name, folder_id)
+            if revit_data:
+                return revit_data
+
+    return None
+
+
+def fetch_revit_version_number(project_response_included_path: dict[str, str | int], target_version_number: int):
+    """Checks a folders items for a revit_version_number matching the target_version_number"""
+    for item in project_response_included_path:
+        try:
+            item["attributes"]["extension"]["data"]["revitProjectVersion"]
+
             if display_name.endswith('.rvt'):
                 if 'included' in contents_data:
                     for included_item in contents_data['included']:
@@ -68,23 +124,8 @@ def extract_revit_data(project_id, project_name, folder_id):
                                     "Revit file ID": item_id,
                                     "Revit version": revit_version
                                 }
-    return None
-
-def search_folders_recursively(project_id, project_name, folder_id):
-    contents_data = fetch_folder_contents(project_id, folder_id)
-
-    for item in contents_data['data']:
-        if item['type'] == 'folders' and 'attributes' in item and 'displayName' in item['attributes']:
-            folder_name = item['attributes']['displayName']
-            if 'Shared' not in folder_name:
-                revit_data = search_folders_recursively(project_id, project_name, item['id'])
-                if revit_data:
-                    return revit_data
-        elif item['type'] == 'items' and 'attributes' in item and 'displayName' in item['attributes']:
-            revit_data = extract_revit_data(project_id, project_name, folder_id)
-            if revit_data:
-                return revit_data
-
+        except KeyError:
+            continue
     return None
 
 def main():
@@ -135,4 +176,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-TOKEN_EXPIRATION_BUFFER = 60  # Buffer time in seconds before token expiration
